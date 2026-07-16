@@ -58,9 +58,22 @@ explicitly in the README.
 ## Section 2 — Clean & Transform (decided)
 
 ### Players.xlsx cleaning
-- Apply plausibility bounds first: weight outside 45–120kg or height outside 150–210cm
-  → set to NULL (found a clear typo: id 373923 weight 59 vs 159 within the same
-  player+team group). Document the bounds and count nulled as a QA metric.
+- **Weight/height column swap (found via user inspection)**: 9 rows have `weight` and
+  `height` literally swapped (e.g. `weight=185, height=74` — physically backwards for
+  an adult, since weight in kg is never greater than height in cm; `weight=74,
+  height=185` is a normal footballer). Detected via `weight > height` (true for exactly
+  9 rows across the whole file) and **swapped back rather than nulled** — this
+  recovers 9 good data points instead of discarding them, which a naive bounds-only
+  check would have done.
+- **Then** apply plausibility bounds: weight outside 45–120kg or height outside
+  150–210cm → set to NULL. After the swap fix, this catches: (a) 25 rows where both
+  `weight==0` and `height==0` together — confirmed as this source's missing-data
+  placeholder (not a swap candidate, since both fields are zero together), correctly
+  nulled; (b) one genuine typo (id 373923, weight 159 vs a paired row's 59 for the same
+  player+team — an extra leading digit, not a swap since 159 > 160 height is false, i.e.
+  159 < 160, so it doesn't trigger the swap rule but does trigger the bounds check).
+  Document counts of swapped vs. nulled as a QA metric — important to distinguish
+  "recovered" from "discarded" in the README.
 - Handle repeated `player_id` values (19 rows across 9 ids found), which are of two
   genuinely different kinds — must be distinguished by normalized name, not id alone:
   1. **Same id, different normalized name** (ids 450720, 669420 — a genuine source data
@@ -106,7 +119,7 @@ explicitly in the README.
 ### Cross-source integration (players ↔ stats)
 - The two files' `player_id` values are in **completely disjoint id spaces** (confirmed:
   0 overlap) — integration is only possible via name + team matching.
-- **Team crosswalk**: a small hardcoded mapping (14 rows) between Players.xlsx's
+- **Team name dictionary**: a small hardcoded mapping (14 rows) between Players.xlsx's
   `team_id` (a team *name* string, e.g. "Sharjah") and stats.xlsx's `team_name`
   (e.g. "Sharjah FC"), since naming conventions differ per file but both lists are
   small and stable. One Players.xlsx team ("AL Sadd - Qatar") has no counterpart in
@@ -197,73 +210,250 @@ explicitly in the README.
         **zero** candidates, confirming he's genuinely absent from the roster file
         rather than "ambiguous among 2 people." This also cleanly resolved
         `"Mohammed Khalaf"` to a single confirmed match.
-- **Final measured result: 449/456 (98.5%) confirmed**, 4 ambiguous (0.9%), 3 unmatched
-  (0.7%) — 7 genuinely uncertain cases total (450/3/3 after the Rodrigo manual override
-  below, i.e. 6 uncertain, 1.3%). These are real, irreducible limitations of the source
-  data, not a matching-logic gap — e.g. two actually-different Brazilian players both
-  simply named `"Rodrigo"` on Al Wasl Club (stats.xlsx never records a surname for
-  him). No amount of string-matching sophistication resolves "the source only gave a
-  first name," so these are correctly left unmatched/logged rather than guessed.
-- **Manual override mechanism**: for a small number of specific ambiguous cases, the
-  user manually verified the correct player via external research (Transfermarkt) —
-  e.g. confirmed only one Brazilian defender named Rodrigo plays for Al Wasl in
-  2025/26, resolving that case to `"Rodrigo Oliveira D'Almeida"`. Rather than treating
-  this as ad hoc, it's implemented as a small, explicit override table (e.g.
-  `data/manual_overrides.csv`: stats `player_id` → confirmed players.xlsx identity,
-  with a comment citing the source and date) applied in code after the automated
-  matching stage — reproducible and auditable, not a hand-edit of the source files.
-  This is reserved for specific verified cases, not a general strategy; remaining
-  ambiguous/unmatched cases without a manual override stay logged as a documented
-  limitation given the assessment's time constraints.
-- Confirmed, ambiguous, and unmatched outcomes are all written to a small QA log
-  (`data/qa/player_match_report.csv`) rather than silently guessing — this is the
-  explicit "matching logic" documentation the assessment asks for.
-- Unmatched/ambiguous stats players are **not dropped** from the model — they still get
-  their own `player_key` (derived from the stats file) so their match stats remain
-  analyzable; they simply lack Players.xlsx enrichment (category/position, and no
-  club-registration row), documented as a known limitation (~2% unenriched/ambiguous).
+
+### ⚠️ Important documentation note: player counts genuinely differ between the two sources
+This must be called out explicitly in the README — it is not a data-quality bug, it
+reflects what each source actually represents:
+- Players.xlsx has **989 player-team registrations** (956 unique physical players,
+  since some players have 2 team registrations — see the dedup logic above) — this is
+  the **full registered squad list** for each club.
+- stats.xlsx has **456 unique players**. Summed per-team, this rises to **474**,
+  because **18 of those 456 players have recorded appearances for 2 different teams**
+  within the season (transfers) — i.e. genuinely counted once per team they played for,
+  not a duplication bug. (438 players appear for exactly 1 team, 18 for exactly 2, none
+  for more than 2.)
+- Per-team, the roster (Players.xlsx) numbers run much higher (52–95 per club) than the
+  stats.xlsx numbers (28–42 per club, or 30–42 before deduping the 18 transfer cases).
+  **Interpretation**: Players.xlsx represents each club's full registered squad
+  (including reserve/B-team players who never make a first-team matchday squad. Checking the Pro League website, this seems to be the "Professional"  and "Amateur" teams.), while
+  stats.xlsx only contains players with **at least one recorded appearance in the Pro
+  League** itself. This is why **510 of the 956 unique roster players (~53%) have zero
+  recorded matches** — 25 of those are on "AL Sadd - Qatar" (a team with no presence in
+  stats.xlsx at all), and the other 485 are real UAEPL-club players who are registered
+  but simply never featured in a recorded league match this season.
+- This should be stated plainly in the README's "known limitations" / "key assumptions"
+  section so a reader doesn't mistake the ~53% non-appearance rate for a matching
+  failure — it's the expected shape of the data (full squad list vs. actual match
+  participants).
 
 ## Section 3 — Data Model (decided)
 
-Six tables — no `competitions` table, since neither source has any competition-level
-data (single league, no signal to build one from); manufacturing an empty/placeholder
-table would be structure the data doesn't support.
+### Core analytical enrichment: merging `player_category` onto stats.xlsx
+The brief specifically emphasizes analyzing the impact/performance of Local vs.
+Resident vs. Foreign players — `player_category` is the central analytical axis for
+Section 5, and it's worth being explicit about where it comes from and why:
+- `name`, `position`, and `team` exist **independently in both files** — the entire
+  point of the Section 2 name/team/position matching pipeline was to answer "which
+  stats.xlsx `player_id` corresponds to which Players.xlsx identity?" Once that link
+  exists, those overlapping fields don't need to be carried over from Players.xlsx as
+  separate values — stats.xlsx's own versions are already complete for all 456 players
+  (Players.xlsx's versions only exist for whoever we successfully matched), so they
+  remain authoritative for anyone with stats.
+- `player_category` (Local/Resident/Foreign), and weight/height, are the **only
+  genuinely new information** Players.xlsx contributes once matching is done — this is
+  the actual value of the whole matching exercise, not a side effect of it.
+- **Practical sourcing rule for the `players` table**: `name`/`position` are sourced
+  from stats.xlsx, and `player_category` is merged in from the matched Players.xlsx row
+  via the Section 2 pipeline. Ambiguous/unmatched stats players (the ~6-10 documented
+  edge cases) get `player_category = NULL`, consistent with the existing "not dropped,
+  just unenriched" decision.
+- **Scoping decision (important)**: the ~510 roster-only players with **zero** recorded
+  stats (documented in the note above) are **excluded from the `players` table
+  entirely** — they don't get merged in. They have no match participation to analyze,
+  so including them would only add empty/null rows with no analytical value for the
+  category-performance comparison the brief asks for. `players` grain is therefore
+  "one row per unique player who appears in stats.xlsx" (456, of which ~446-450 get a
+  `player_category` and ~6-10 stay NULL), not "every registered player league-wide."
+  The 510-player finding stays fully documented as a data-characteristic note (README),
+  it's just not modeled as rows in this table.
 
-### Dimensions
-- **`teams`** — grain: one row per team (~14-15, from the Section 2 crosswalk).
-  `team_key` (surrogate PK), `canonical_name`, `players_source_name` (e.g. "Sharjah"),
-  `stats_source_name` (e.g. "Sharjah FC") — both source spellings kept for traceability.
-- **`players`** — grain: one row per unique player identity (the stable entity from
-  Section 2: name, category, position — confirmed invariant across all duplicate/stint
-  groups). `player_key` (surrogate PK), `canonical_name`, `player_category`
-  (Local/Resident/Foreign), `position` (standardized to stats.xlsx's vocabulary —
-  Goalkeeper/Defender/Midfielder/Attacker — via the Section 2 crosswalk, since that's
-  the more conventional English terminology), `source_player_id_players`,
-  `source_player_id_stats` (both nullable — an ambiguous/unmatched stats player has no
-  roster id; a roster player with no recorded stats has no stats id), and
-  **`match_status`** (`confirmed` / `manual_override` / `ambiguous` / `unmatched`) so
-  the ~1.3% of imperfectly-linked players are visibly flagged in the model itself, not
-  a fact only living in a README.
-- **`matches`** — grain: one row per match (121 distinct `match_id`s). `match_key`,
-  `match_date`. No richer metadata exists (confirmed in Section 2).
+**Four tables** (simplified down from an initial six — `matches` and `match_teams`
+were dropped as too thin to justify their own table, and `player_club_registrations`
+was narrowed to a small side table only for the minority of players with 2 clubs).
+No `competitions` table either, since neither source has any competition-level data.
 
-### Bridges
-- **`player_club_registrations`** — grain: one row per (player, team, season).
-  `player_key` FK, `team_key` FK, `season`, `weight`, `height` (as recorded at that
-  specific club — preserves transfer history per the earlier decision not to collapse
-  multi-team rows).
-- **`match_teams`** — grain: one row per (match, team), normally 2 rows per match.
-  `match_key` FK, `team_key` FK. No home/away distinction, since that data isn't
-  available.
+### `teams`
+Purpose: canonical reference reconciling the two different team-naming conventions
+used across the sources. Grain: one row per team (~14-15, from the Section 2
+crosswalk). `team_key` (surrogate PK), `canonical_name`, `players_source_name` (e.g.
+"Sharjah"), `stats_source_name` (e.g. "Sharjah FC").
 
-### Fact
-- **`player_match_stats`** — grain: one row per (player, match, stat_type) — mirrors
-  stats.xlsx's natural long format exactly, avoiding hardcoding the 36 stat types into
-  the schema. `player_key` FK, `match_key` FK, **`team_key` FK stored directly on this
-  table** (not inferred via `player_club_registrations`), since a player's match-day
-  team can differ from their season-level registration if they transferred mid-season.
-  `stat_type`, `stat_value`.
+### `players`
+Purpose: the core player dimension — identity, position, and (critically)
+`player_category`, the central axis for the category-performance analysis the brief
+asks for — plus each player's primary club, folded in directly rather than requiring
+a join for the common case. Grain: one row per unique player **who appears in
+stats.xlsx** (456 total) — roster-only players with zero recorded stats are excluded
+(see scoping decision above; they don't get merged in since they have no match
+participation to analyze).
+- `player_key` (surrogate PK)
+- `canonical_name`, `position` — sourced from stats.xlsx (standardized to its
+  vocabulary — Goalkeeper/Defender/Midfielder/Attacker — since it's already complete
+  and authoritative for every row at this grain)
+- `player_category` (Local/Resident/Foreign) — merged in from the matched Players.xlsx
+  row via the Section 2 pipeline; NULL for the ~6-10 ambiguous/unmatched edge cases
+- `team_key` (FK) — the player's **primary club**. For the ~416 single-club players
+  this is simply their one team. For the ~18-30 players who played for 2 different
+  clubs, primary = **most recent club by last match_date** (same rule used for the
+  earlier per-team headcount table, for consistency); their earlier club
+  goes into `player_transfers` below instead of being dropped
+- `source_player_id_players`, `source_player_id_stats` (nullable — unmatched/ambiguous
+  players have no roster id)
+- `match_status` (`confirmed` / `manual_override` / `ambiguous` / `unmatched`) — so the
+  small fraction of imperfectly-linked players are visibly flagged in the model itself
 
-## Section 4 — Database Creation & Loading (not yet planned)
+**Dropped: `weight`/`height`**. These were investigated thoroughly in Section 2 (the
+column-swap bug affecting 9 rows, the 25 zero-as-missing rows, the one-off typo) and
+that finding stays fully documented in the README as a real data-quality catch — but
+the fields themselves are excluded from the final model: they don't serve the
+Local/Resident/Foreign performance analysis the brief centers on, and between the
+swap-bug rows, the zero-placeholder rows, and the ~6-10 unmatched/ambiguous players
+with no roster link at all, a meaningful share would be NULL regardless. Simpler to
+document the finding than to carry partially-unreliable columns into the schema for no
+analytical benefit.
 
-## Section 5 — Analytical Output (not yet planned)
+### `player_transfers`
+Purpose: a deliberately small side table that exists **only** to avoid silently
+dropping a player's earlier club when they transferred mid-season — everyone with a
+single club simply has no row here at all. This was chosen over collapsing multi-club
+players into one row (data loss) and over a full `player_club_registrations` bridge
+for every player (unnecessary for the ~93% with just one club). Grain: one row per
+(player, additional prior team) — expected ~18-30 rows total. `player_key` (FK),
+`team_key` (FK, the non-primary/earlier club). No weight/height here, since the
+interesting fact is simply "this player also played for this team," not a second
+biometric snapshot.
+
+### `player_match_stats`
+Purpose: the core fact table — every recorded performance metric, kept in its natural
+long format so no stat type is hardcoded into the schema; this is what
+Section 5's category-based analysis (Local vs. Resident vs. Foreign performance)
+will aggregate over. Grain: one row per (player, match, stat_type) — mirrors
+stats.xlsx's own grain exactly. `player_key` (FK), `match_id`, `match_date` (both
+inlined directly here rather than via a separate `matches` table, since that
+dimension held nothing beyond these two fields), `team_key` (FK, stored directly —
+**not** inferred from `players.team_key` — so a player's match-day team is always
+correct even when it differs from their current primary club), `stat_type`,
+`stat_value`. Which two teams contested a given match (previously `match_teams`) is
+fully derivable via `SELECT DISTINCT team_key WHERE match_id = X` on this table, so it
+isn't materialized separately.
+
+## Section 4 — Database Creation & Loading (decided)
+
+**Engine: SQLite** (stdlib `sqlite3` — no extra dependency; single portable `.db` file
+anyone can open with any SQLite browser; satisfies "include the completed database
+file" as a literal deliverable). All three allowed engines were equally valid; SQLite
+is the simplest given the assessment's emphasis on workflow over performance/scale.
+
+**Schema** — 6 physical tables: the 2 raw landing tables from Section 1
+(`raw_players`, `raw_player_match_stats` — unmodified copies, for lineage/auditability
+of the raw→clean pipeline) plus the 4 clean model tables from Section 3.
+
+```sql
+CREATE TABLE raw_players (
+    player_id INTEGER, player TEXT, player_category TEXT, weight REAL,
+    height REAL, position TEXT, team_id TEXT, season TEXT
+);
+
+CREATE TABLE raw_player_match_stats (
+    match_id TEXT, team_id TEXT, player_id TEXT, stat_type TEXT, stat_value INTEGER,
+    nationality TEXT, team_name TEXT, player_name TEXT, player_name_short TEXT,
+    date_of_birth TEXT, position TEXT, match_date TEXT
+);
+
+CREATE TABLE teams (
+    team_key INTEGER PRIMARY KEY,
+    canonical_name TEXT NOT NULL,
+    players_source_name TEXT,
+    stats_source_name TEXT
+);
+
+CREATE TABLE players (
+    player_key INTEGER PRIMARY KEY,
+    canonical_name TEXT NOT NULL,
+    position TEXT,
+    player_category TEXT,
+    team_key INTEGER REFERENCES teams(team_key),
+    source_player_id_players TEXT,
+    source_player_id_stats TEXT,
+    match_status TEXT CHECK (match_status IN ('confirmed','manual_override','ambiguous','unmatched'))
+);
+
+CREATE TABLE player_transfers (
+    player_key INTEGER REFERENCES players(player_key),
+    team_key INTEGER REFERENCES teams(team_key),
+    PRIMARY KEY (player_key, team_key)
+);
+
+CREATE TABLE player_match_stats (
+    player_key INTEGER REFERENCES players(player_key),
+    match_id TEXT,
+    match_date TEXT,
+    team_key INTEGER REFERENCES teams(team_key),
+    stat_type TEXT,
+    stat_value INTEGER,
+    PRIMARY KEY (player_key, match_id, stat_type)
+);
+```
+
+**Loading & repeatability**: `src/build_db.py` deletes any existing `data/uaepl.db`
+and rebuilds fresh every run (no `DROP TABLE IF EXISTS` accumulation risk, no
+duplicate rows on re-run — critical for the "repeatable" requirement), then loads
+each table in dependency order: `teams` → `players` → `player_transfers` →
+`player_match_stats`, sourced from the already-validated Section 2 cleaning/matching
+logic (which gets consolidated from scratch-tested snippets into real modules here).
+
+**File layout**:
+```
+src/ingest.py     — load_players_raw(), load_stats_raw()
+src/clean.py      — name+team dedup (weight/height swap-fix investigated but not
+                    implemented — those columns were dropped from the final model,
+                    see Section 3; the finding stays documented in the README)
+src/match.py      — mojibake fix, normalize, 4-stage matching, tie-breaks,
+                    claim-exclusion, manual overrides
+src/build_db.py   — schema DDL + load logic
+run_pipeline.py   — top-level: ingest → clean → match → build_db, one command
+requirements.txt  — pandas, openpyxl
+data/manual_overrides.csv       — the Rodrigo override (stats player_id -> roster identity)
+data/qa/player_match_report.csv — confirmed/ambiguous/unmatched log (generated)
+data/uaepl.db                   — the deliverable database (generated, committed)
+```
+
+A fresh clone + `pip install -r requirements.txt` + `python run_pipeline.py`
+reproduces the entire database from the two raw source files with no manual steps.
+
+## Section 5 — Analytical Output (decided)
+
+**Format**: a Streamlit app (`app.py`), reading directly from `data/uaepl.db` via
+`pandas.read_sql`. Centered on the brief's explicit ask (analysis of player
+categories) and the recruiters' specific emphasis on foreign-player impact.
+
+**Global team filter**: a sidebar dropdown — every team plus an **"All Teams"**
+option — scopes the *entire* dashboard, not just one chart. With "All Teams" selected,
+every section below shows league-wide category comparisons; selecting a specific team
+scopes every section down to that team's players only (e.g. "within Sharjah FC, how do
+Local/Resident/Foreign players compare on goals-per-90"). This is what lets the
+dashboard answer both "how does the league look overall" and "how does this
+specifically play out within one squad."
+
+**Sections** (as `st.tabs()`):
+1. **Squad composition** — the core "impact" story. With "All Teams": a stacked bar
+   chart of Local/Resident/Foreign composition per team (shows which clubs rely most
+   on foreign talent) + league-wide KPI tiles. With a specific team selected: that
+   team's own category breakdown (simple donut/bar) + that team's KPI tiles.
+2. **Playing time by category** — bar chart of average minutes played per category,
+   scoped by the team filter. Answers whether a category is actually getting on the
+   pitch more/less, and serves as the per-90 normalization base for sections 3-4.
+3. **Attacking output by category** — goals and assists **per-90-minutes** (not raw
+   totals, since playing time differs by category) by category, faceted by position
+   where relevant (this comparison mainly matters within Attackers/Midfielders).
+4. **Passing by category** — pass accuracy % (`accuratePass / totalPass`) by category.
+5. **Defensive performance by category** — **successful tackle %**
+   (`wonTackle / totalTackle`) by category — a genuine defensive-skill signal,
+   replacing the earlier "cards per 90" idea with something more analytically useful.
+6. **Leaderboards** — top scorers/assists table, with category as a filterable
+   column/badge, scoped by the team filter.
+
+**Methodology note to state explicitly in the dashboard/README**: per-90 and
+percentage-based metrics are used deliberately instead of raw counts, since comparing
+raw totals across categories (or teams) would be misleading if one group tends to
+play more minutes on average.
